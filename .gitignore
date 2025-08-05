@@ -1,0 +1,16 @@
+# Entornos virtuales
+backend/venv/
+
+# Dependencias de Node
+frontend/node_modules/
+
+# Archivos de build del frontend
+frontend/build/
+
+# Archivos de configuración de VS Code
+.vscode/
+
+# Archivos del sistema operativo
+__pycache__/
+*.pyc
+.DS_Store
