@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  # Servicio del Backend
+  backend:
+    build: ./backend
+    ports:
+      - "5000:5000"
+    volumes:
+      # Esto asegura que la base de datos se guarde en tu computadora
+      # y no se borre cada vez que detienes el contenedor.
+      - ./database:/app/database
+
+  # Servicio del Frontend
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80" # Mapeamos el puerto 80 del contenedor al 3000 de tu máquina
+
