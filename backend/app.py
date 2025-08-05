@@ -1,15 +1,32 @@
 # backend/app.py
 import sqlite3
 import bcrypt
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests
-
+import os
 
 app = Flask(__name__)
 CORS(app)
 
-DATABASE_PATH = '../database/pagos.db'
+# --- CONFIGURACIÓN DE LA BASE DE DATOS PARA RENDER ---
+DATABASE_PATH = os.path.join(os.environ.get('RENDER_DISK_PATH', '..'), 'database', 'pagos.db')
+SCHEMA_PATH = os.path.join(os.path.dirname(__file__), '..', 'database', 'schema.sql')
+
+def init_db():
+    """Inicializa la base de datos si no existe."""
+    db_dir = os.path.dirname(DATABASE_PATH)
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir)
+
+    if not os.path.exists(DATABASE_PATH):
+        print("Creando la base de datos...")
+        conn = sqlite3.connect(DATABASE_PATH)
+        with open(SCHEMA_PATH, 'r') as f:
+            conn.executescript(f.read())
+        conn.commit()
+        conn.close()
+        print("Base de datos creada exitosamente.")
 
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_PATH)
@@ -155,15 +172,10 @@ def delete_tipo_pago(id_tipo_pago):
         conn.execute("DELETE FROM tipos_pago WHERE id_tipo_pago = ?", (id_tipo_pago,))
         conn.commit()
     except sqlite3.IntegrityError:
-        # Esto ocurrirá si una orden de pago existente está usando este tipo de pago.
         return jsonify({"error": "No se puede eliminar el tipo de pago porque está en uso"}), 409
     finally:
         conn.close()
     return jsonify({"message": "Tipo de pago eliminado exitosamente"}), 200
-
-# Añade estas nuevas rutas en backend/app.py
-
-# --- RUTAS CRUD PARA CATÁLOGO DE TIPOS DE DEVOLUCIÓN ---
 
 @app.route('/api/catalogos/tipos_devolucion', methods=['GET'])
 def get_tipos_devolucion():
@@ -216,104 +228,59 @@ def delete_tipo_devolucion(id_tipo_devolucion):
 @app.route('/api/reportes/summary', methods=['GET'])
 def get_report_summary():
     conn = get_db_connection()
-
-    # Reporte 1: Pagos generados por cada coordinador
     pagos_por_coordinador = conn.execute("""
         SELECT u.nombre || ' ' || u.apellido as coordinador, COUNT(o.id_orden) as total_ordenes
-        FROM ordenes_pago o
-        JOIN usuarios u ON o.id_coordinador = u.id_usuario
-        GROUP BY o.id_coordinador
+        FROM ordenes_pago o JOIN usuarios u ON o.id_coordinador = u.id_usuario GROUP BY o.id_coordinador
     """).fetchall()
-
-    # Reporte 2: Pagos revisados por cada analista (basado en la bitácora)
     pagos_por_analista = conn.execute("""
         SELECT u.nombre || ' ' || u.apellido as analista, COUNT(b.id_bitacora) as total_acciones
-        FROM bitacora b
-        JOIN usuarios u ON b.id_usuario_accion = u.id_usuario
-        WHERE b.accion IN ('PAGAR_ORDEN', 'DEVOLVER_ORDEN')
-        GROUP BY b.id_usuario_accion
+        FROM bitacora b JOIN usuarios u ON b.id_usuario_accion = u.id_usuario WHERE b.accion IN ('PAGAR_ORDEN', 'DEVOLVER_ORDEN') GROUP BY b.id_usuario_accion
     """).fetchall()
-
-    # Reporte 3: Reporte por tipo de pago
     reporte_tipo_pago = conn.execute("""
         SELECT tp.nombre_tipo, COUNT(o.id_orden) as total
-        FROM ordenes_pago o
-        JOIN tipos_pago tp ON o.id_tipo_pago = tp.id_tipo_pago
-        GROUP BY tp.nombre_tipo
+        FROM ordenes_pago o JOIN tipos_pago tp ON o.id_tipo_pago = tp.id_tipo_pago GROUP BY tp.nombre_tipo
     """).fetchall()
-
-    # Reporte 4: Cantidad total de pagos realizados
     total_pagos_realizados = conn.execute("SELECT COUNT(*) as total FROM ordenes_pago WHERE estado = 'Pagada'").fetchone()
-
     conn.close()
-
     summary = {
         "pagos_por_coordinador": [dict(row) for row in pagos_por_coordinador],
         "pagos_por_analista": [dict(row) for row in pagos_por_analista],
         "reporte_tipo_pago": [dict(row) for row in reporte_tipo_pago],
         "total_pagos_realizados": dict(total_pagos_realizados)
     }
-
     return jsonify(summary), 200
 
 @app.route('/api/exchange/update', methods=['POST'])
 def update_exchange_rates():
-    # URL de la API gratuita. La base es USD.
     api_url = "https://open.er-api.com/v6/latest/USD"
-
     try:
         response = requests.get(api_url)
-        response.raise_for_status() # Lanza un error si la petición no fue exitosa (ej. 404, 500)
+        response.raise_for_status()
         data = response.json()
-
         if data.get("result") == "success":
             rates = data.get("rates")
             conn = get_db_connection()
             cursor = conn.cursor()
-
-            # Actualizamos cada moneda que tenemos en nuestra BD con el valor de la API
             for codigo, valor in rates.items():
-                cursor.execute(
-                    "UPDATE monedas SET tipo_cambio = ?, ultima_actualizacion = CURRENT_TIMESTAMP WHERE codigo_moneda = ?",
-                    (valor, codigo)
-                )
-
+                cursor.execute("UPDATE monedas SET tipo_cambio = ?, ultima_actualizacion = CURRENT_TIMESTAMP WHERE codigo_moneda = ?", (valor, codigo))
             conn.commit()
             conn.close()
             return jsonify({"message": "Tipos de cambio actualizados exitosamente"}), 200
         else:
             return jsonify({"error": "La respuesta de la API externa no fue exitosa"}), 500
-
     except requests.exceptions.RequestException as e:
         return jsonify({"error": "Error al conectar con el servicio de tipos de cambio", "details": str(e)}), 503
     except Exception as e:
         return jsonify({"error": "Ocurrió un error inesperado", "details": str(e)}), 500
-@app.route('/')
-def index():
-    return jsonify({"message": "API del Sistema de Pagos funcionando!"})
 
 # --- RUTAS PARA ÓRDENES DE PAGO ---
-
 @app.route('/api/ordenes', methods=['POST'])
 def create_orden():
     data = request.get_json()
-    # Obtenemos todos los campos del JSON
-    id_coordinador = data.get('id_coordinador')
-    monto = data.get('monto')
-    id_moneda = data.get('id_moneda')
-    id_tipo_pago = data.get('id_tipo_pago')
-    fecha_factura = data.get('fecha_factura')
-    fecha_vencimiento = data.get('fecha_vencimiento')
-    # Nuevos campos
-    urgente = data.get('urgente', 0) # Valor por defecto 0 (No)
-    impuesto = data.get('impuesto', 0.0)
-    descuento = data.get('descuento', 0.0)
-    acreedor = data.get('acreedor')
-    documento_compensacion = data.get('documento_compensacion')
-
+    id_coordinador, monto, id_moneda, id_tipo_pago, fecha_factura, fecha_vencimiento = data.get('id_coordinador'), data.get('monto'), data.get('id_moneda'), data.get('id_tipo_pago'), data.get('fecha_factura'), data.get('fecha_vencimiento')
+    urgente, impuesto, descuento, acreedor, documento_compensacion = data.get('urgente', 0), data.get('impuesto', 0.0), data.get('descuento', 0.0), data.get('acreedor'), data.get('documento_compensacion')
     if not all([id_coordinador, monto, id_moneda, id_tipo_pago, fecha_factura, fecha_vencimiento]):
         return jsonify({"error": "Faltan datos para crear la orden"}), 400
-
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -333,19 +300,13 @@ def create_orden():
         return jsonify({"error": "Error en la base de datos", "details": str(e)}), 500
     finally:
         conn.close()
-
     return jsonify({"message": "Orden de pago creada exitosamente"}), 201
 
 @app.route('/api/ordenes/<int:id_coordinador>', methods=['GET'])
 def get_ordenes_by_coordinador(id_coordinador):
-    # Obtenemos los parámetros de filtro de la URL
     query_params = request.args
-    filter_estado = query_params.get('estado', 'todos')
-    filter_tipo_pago = query_params.get('tipo_pago', 'todos')
-
+    filter_estado, filter_tipo_pago = query_params.get('estado', 'todos'), query_params.get('tipo_pago', 'todos')
     conn = get_db_connection()
-
-    # Construcción de la consulta base
     base_query = """
         SELECT o.id_orden, o.monto, o.urgente, o.estado, o.fecha_pago_real, m.codigo_moneda, tp.nombre_tipo as tipo_pago
         FROM ordenes_pago o
@@ -354,57 +315,40 @@ def get_ordenes_by_coordinador(id_coordinador):
         WHERE o.id_coordinador = ?
     """
     params = [id_coordinador]
-
-    # Añadir filtros si no son 'todos'
     if filter_estado != 'todos':
         base_query += " AND o.estado = ?"
         params.append(filter_estado)
-
     if filter_tipo_pago != 'todos':
         base_query += " AND o.id_tipo_pago = ?"
         params.append(filter_tipo_pago)
-
     base_query += " ORDER BY o.fecha_creacion DESC"
-
     ordenes_cursor = conn.execute(base_query, tuple(params)).fetchall()
     conn.close()
-
     ordenes = [dict(row) for row in ordenes_cursor]
     return jsonify(ordenes), 200
 
-# Reemplaza la función enviar_orden existente con esta
 @app.route('/api/ordenes/<int:id_orden>/enviar', methods=['PUT'])
 def enviar_orden(id_orden):
     data = request.get_json()
-    id_usuario = data.get('id_usuario') # Obtenemos el ID del usuario que realiza la acción
+    id_usuario = data.get('id_usuario')
     if not id_usuario:
         return jsonify({"error": "No se identificó al usuario"}), 400
-
     conn = get_db_connection()
     try:
         conn.execute("UPDATE ordenes_pago SET estado = 'Enviada' WHERE id_orden = ?", (id_orden,))
-        conn.execute(
-            "INSERT INTO bitacora (id_usuario_accion, accion, id_orden_afectada) VALUES (?, ?, ?)",
-            (id_usuario, 'ENVIAR_ORDEN', id_orden)
-        )
+        conn.execute("INSERT INTO bitacora (id_usuario_accion, accion, id_orden_afectada) VALUES (?, ?, ?)", (id_usuario, 'ENVIAR_ORDEN', id_orden))
         conn.commit()
     except Exception as e:
         return jsonify({"error": "Error al actualizar la orden", "details": str(e)}), 500
     finally:
         conn.close()
-
     return jsonify({"message": "Orden enviada al analista exitosamente"}), 200
 
 @app.route('/api/ordenes/enviadas', methods=['GET'])
 def get_ordenes_enviadas():
-    # Obtenemos los parámetros de búsqueda y filtro de la URL
     query_params = request.args
-    search_term = query_params.get('buscar', '')
-    filter_urgente = query_params.get('urgente', 'todos') # 'todos', 'si', 'no'
-
+    search_term, filter_urgente = query_params.get('buscar', ''), query_params.get('urgente', 'todos')
     conn = get_db_connection()
-
-    # Construcción de la consulta base
     base_query = """
         SELECT o.*, m.codigo_moneda, u.nombre as coordinador_nombre, u.apellido as coordinador_apellido
         FROM ordenes_pago o
@@ -412,140 +356,96 @@ def get_ordenes_enviadas():
         JOIN usuarios u ON o.id_coordinador = u.id_usuario
         WHERE o.estado = 'Enviada'
     """
-
     params = []
-    # Añadir filtro de búsqueda
     if search_term:
         base_query += " AND (o.acreedor LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ?)"
         like_term = f"%{search_term}%"
         params.extend([like_term, like_term, like_term])
-
-    # Añadir filtro de urgencia
     if filter_urgente == 'si':
         base_query += " AND o.urgente = 1"
     elif filter_urgente == 'no':
         base_query += " AND o.urgente = 0"
-
     base_query += " ORDER BY o.urgente DESC, o.fecha_vencimiento ASC"
-
     ordenes_cursor = conn.execute(base_query, params).fetchall()
     conn.close()
-
     ordenes = [dict(row) for row in ordenes_cursor]
     return jsonify(ordenes), 200
 
 @app.route('/api/ordenes/<int:id_orden>/devolver', methods=['PUT'])
 def devolver_orden(id_orden):
-    """Devuelve una orden, cambiando su estado a 'Devuelta'."""
     data = request.get_json()
-    motivo = data.get('motivo', 'Sin motivo especificado')
-    id_analista = data.get('id_analista')
-
+    motivo, id_analista = data.get('motivo', 'Sin motivo especificado'), data.get('id_analista')
     if not id_analista:
         return jsonify({"error": "Se requiere la identificación del analista"}), 400
-
     conn = get_db_connection()
     try:
-        # Cambiamos el estado de la orden
         conn.execute("UPDATE ordenes_pago SET estado = 'Devuelta' WHERE id_orden = ?", (id_orden,))
-        # Insertamos el registro en la tabla de devoluciones
         conn.execute("INSERT INTO devoluciones (id_orden, motivo, id_analista) VALUES (?, ?, ?)", (id_orden, motivo, id_analista))
-        conn.execute(
-        "INSERT INTO bitacora (id_usuario_accion, accion, detalles, id_orden_afectada) VALUES (?, ?, ?, ?)",
-        (id_analista, 'DEVOLVER_ORDEN', f'Motivo: {motivo}', id_orden)
-        )   
+        conn.execute("INSERT INTO bitacora (id_usuario_accion, accion, detalles, id_orden_afectada) VALUES (?, ?, ?, ?)", (id_analista, 'DEVOLVER_ORDEN', f'Motivo: {motivo}', id_orden))
         conn.commit()
     except Exception as e:
         return jsonify({"error": "Error al devolver la orden", "details": str(e)}), 500
     finally:
         conn.close()
-
     return jsonify({"message": "Orden devuelta exitosamente"}), 200
 
-# Reemplaza la función pagar_orden existente con esta
 @app.route('/api/ordenes/<int:id_orden>/pagar', methods=['PUT'])
 def pagar_orden(id_orden):
     data = request.get_json()
     id_analista = data.get('id_analista')
     if not id_analista:
         return jsonify({"error": "No se identificó al analista"}), 400
-
     conn = get_db_connection()
     try:
         conn.execute("UPDATE ordenes_pago SET estado = 'Pagada', fecha_pago_real = CURRENT_DATE WHERE id_orden = ?", (id_orden,))
-        conn.execute(
-            "INSERT INTO bitacora (id_usuario_accion, accion, id_orden_afectada) VALUES (?, ?, ?)",
-            (id_analista, 'PAGAR_ORDEN', id_orden)
-        )
+        conn.execute("INSERT INTO bitacora (id_usuario_accion, accion, id_orden_afectada) VALUES (?, ?, ?)", (id_analista, 'PAGAR_ORDEN', id_orden))
         conn.commit()
     except Exception as e:
         return jsonify({"error": "Error al pagar la orden", "details": str(e)}), 500
     finally:
         conn.close()
-
     return jsonify({"message": "Orden marcada como pagada exitosamente"}), 200
-
-# Añade esta nueva ruta en backend/app.py
 
 @app.route('/api/ordenes/historial', methods=['GET'])
 def get_historial_ordenes():
-    """Obtiene un historial completo de todas las órdenes, con filtros."""
     query_params = request.args
-    search_term = query_params.get('buscar', '')
-    filter_estado = query_params.get('estado', 'todos')
-
+    search_term, filter_estado = query_params.get('buscar', ''), query_params.get('estado', 'todos')
     conn = get_db_connection()
-
     base_query = """
         SELECT o.*, m.codigo_moneda, u.nombre as coordinador_nombre, u.apellido as coordinador_apellido
         FROM ordenes_pago o
         JOIN monedas m ON o.id_moneda = m.id_moneda
         JOIN usuarios u ON o.id_coordinador = u.id_usuario
     """
-
-    # Usamos una lista para los WHERE para unirlos con 'AND'
-    where_clauses = []
-    params = []
-
+    where_clauses, params = [], []
     if search_term:
         where_clauses.append("(o.acreedor LIKE ? OR u.nombre LIKE ? OR u.apellido LIKE ?)")
         like_term = f"%{search_term}%"
         params.extend([like_term, like_term, like_term])
-
     if filter_estado != 'todos':
         where_clauses.append("o.estado = ?")
         params.append(filter_estado)
-
     if where_clauses:
         base_query += " WHERE " + " AND ".join(where_clauses)
-
     base_query += " ORDER BY o.id_orden DESC"
-
     ordenes_cursor = conn.execute(base_query, tuple(params)).fetchall()
     conn.close()
-
     ordenes = [dict(row) for row in ordenes_cursor]
     return jsonify(ordenes), 200
 
-# --- RUTA PARA BITÁCORA ---
 @app.route('/api/bitacora', methods=['GET'])
 def get_bitacora():
     conn = get_db_connection()
     logs_cursor = conn.execute("""
         SELECT b.id_bitacora, u.nombre, u.apellido, b.accion, b.detalles, b.id_orden_afectada, b.fecha_accion
-        FROM bitacora b
-        JOIN usuarios u ON b.id_usuario_accion = u.id_usuario
-        ORDER BY b.fecha_accion DESC
+        FROM bitacora b JOIN usuarios u ON b.id_usuario_accion = u.id_usuario ORDER BY b.fecha_accion DESC
     """).fetchall()
     conn.close()
     logs = [dict(row) for row in logs_cursor]
     return jsonify(logs), 200
 
-# Añade estas nuevas rutas en backend/app.py
-
 @app.route('/api/ordenes/detalle/<int:id_orden>', methods=['GET'])
 def get_orden_detalle(id_orden):
-    """Obtiene todos los detalles de una única orden para poder editarla."""
     conn = get_db_connection()
     orden = conn.execute("SELECT * FROM ordenes_pago WHERE id_orden = ?", (id_orden,)).fetchone()
     conn.close()
@@ -555,24 +455,19 @@ def get_orden_detalle(id_orden):
 
 @app.route('/api/ordenes/<int:id_orden>', methods=['PUT'])
 def update_orden(id_orden):
-    """Actualiza los datos de una orden existente."""
     data = request.get_json()
     monto, id_moneda, id_tipo_pago, fecha_factura, fecha_vencimiento = data.get('monto'), data.get('id_moneda'), data.get('id_tipo_pago'), data.get('fecha_factura'), data.get('fecha_vencimiento')
-
     if not all([monto, id_moneda, id_tipo_pago, fecha_factura, fecha_vencimiento]):
         return jsonify({"error": "Faltan datos para actualizar la orden"}), 400
-
     conn = get_db_connection()
     try:
-        # Al editar, cambiamos el estado de nuevo a 'Creada' para que siga el flujo normal
         conn.execute(
             """UPDATE ordenes_pago 
                SET monto = ?, id_moneda = ?, id_tipo_pago = ?, fecha_factura = ?, fecha_vencimiento = ?, estado = 'Creada', fecha_ultima_modificacion = CURRENT_TIMESTAMP
                WHERE id_orden = ?""",
             (monto, id_moneda, id_tipo_pago, fecha_factura, fecha_vencimiento, id_orden)
         )
-        # También registramos la edición en la bitácora
-        id_coordinador = data.get('id_coordinador') # El frontend debe enviar el ID del usuario
+        id_coordinador = data.get('id_coordinador')
         if id_coordinador:
              conn.execute(
                 "INSERT INTO bitacora (id_usuario_accion, accion, detalles, id_orden_afectada) VALUES (?, ?, ?, ?)",
@@ -583,8 +478,14 @@ def update_orden(id_orden):
         return jsonify({"error": "Error al actualizar la orden", "details": str(e)}), 500
     finally:
         conn.close()
-
     return jsonify({"message": "Orden actualizada exitosamente"}), 200
 
+@app.route('/')
+def index():
+    return jsonify({"message": "API del Sistema de Pagos funcionando!"})
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    init_db()
+    app.run(debug=False, port=5000)
+else:
+    init_db()
