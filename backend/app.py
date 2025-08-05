@@ -3,7 +3,7 @@ import sqlite3
 import bcrypt
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import os # <--- AÑADIR IMPORT
+import os 
 import requests
 
 
